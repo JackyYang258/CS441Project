@@ -1,0 +1,3 @@
+# Ignore training checkpoints and outputs
+iclr_results/
+scibert_iclr_results/
