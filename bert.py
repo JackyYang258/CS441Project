@@ -1,12 +1,28 @@
+# CUDA_VISIBLE_DEVICES=5,6,7 python bert.py
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 from datasets import Dataset
 import torch
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 from transformers import BertForSequenceClassification, BertTokenizer
 from transformers import Trainer, TrainingArguments
+import torch.nn as nn
+
+class WeightedTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.get("labels")
+        # forward pass
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+        
+        # 使用 CrossEntropyLoss 并传入我们算好的权重
+        loss_fct = nn.CrossEntropyLoss(weight=class_weights)
+        loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
+        
+        return (loss, outputs) if return_outputs else loss
 
 
 def load_iclr_dataset(years=(2022, 2023)):
@@ -48,10 +64,25 @@ train_dataset = Dataset.from_pandas(train_df)
 val_dataset = Dataset.from_pandas(val_df)
 test_dataset = Dataset.from_pandas(test_df)
 
+
+# Compute class weights
+y_train_labels = train_df["label"].values
+class_counts = np.bincount(y_train_labels)
+class_weights = torch.tensor(
+    len(y_train_labels) / (2.0 * class_counts), 
+    dtype=torch.float
+).to("cuda" if torch.cuda.is_available() else "cpu")
+
+print(f"Computed Class Weights: {class_weights}")
+
 # 3. Load BERT Tokenizer
-tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+# tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 # allenai/scibert_scivocab_uncased
 # tokenizer = BertTokenizer.from_pretrained("allenai/scibert_scivocab_uncased")
+
+
+model_name = "allenai/scibert_scivocab_uncased" 
+tokenizer = BertTokenizer.from_pretrained(model_name)
 
 # Tokenization function
 def tokenize(batch):
@@ -72,10 +103,16 @@ val_dataset = val_dataset.with_format("torch", columns=['input_ids','attention_m
 test_dataset = test_dataset.with_format("torch", columns=['input_ids','attention_mask','label'])
 
 # 4. Load BERT Model
-model = BertForSequenceClassification.from_pretrained(
-    "bert-base-uncased",
-    num_labels=2
-)
+# model = BertForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=2)
+model = BertForSequenceClassification.from_pretrained(model_name, num_labels=2)
+
+# Check and set CUDA device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA Version: {torch.version.cuda}")
+model = model.to(device)
 
 # 5. Define Metrics
 def compute_metrics(pred):
@@ -86,23 +123,45 @@ def compute_metrics(pred):
     return {"accuracy": acc, "precision": precision, "recall": recall, "f1": f1}
 
 # 6. Training Settings
+# training_args = TrainingArguments(
+#     output_dir="./iclr_results",
+#     eval_strategy="epoch",
+#     save_strategy="epoch",            
+#     learning_rate=2e-5,
+#     per_device_train_batch_size=8,   
+#     per_device_eval_batch_size=8,
+#     num_train_epochs=5,               
+#     weight_decay=0.01,
+#     fp16=True,                        # 优化：开启混合精度加速
+#     load_best_model_at_end=True,
+#     metric_for_best_model="f1",       # 优化：根据 F1 分数选最好的模型，而不是 Loss
+#     save_total_limit=2                # 只保存最近的2个模型，节省硬盘
+# )
 training_args = TrainingArguments(
-    output_dir="./iclr_results",
-    evaluation_strategy="epoch",
-    save_strategy="epoch",            
-    learning_rate=2e-5,
-    per_device_train_batch_size=8,   
+    output_dir="./iclr_results_optimized",
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    learning_rate=2e-5,             # 稍微调大一点点尝试
+    per_device_train_batch_size=8,
+    gradient_accumulation_steps=4,  # 【新增】累积4步，相当于 Batch Size = 32，更稳
     per_device_eval_batch_size=8,
-    num_train_epochs=5,               
-    weight_decay=0.01,
-    fp16=True,                        # 优化：开启混合精度加速
+    num_train_epochs=5,
+    weight_decay=2e-2,
+    fp16=True,
     load_best_model_at_end=True,
-    metric_for_best_model="f1",       # 优化：根据 F1 分数选最好的模型，而不是 Loss
-    save_total_limit=2                # 只保存最近的2个模型，节省硬盘
+    metric_for_best_model="f1",     # 坚持用 F1 或 Recall，不要用 Accuracy
+    save_total_limit=2
 )
 
 # 7. Trainer API
-trainer = Trainer(
+# trainer = Trainer(
+#     model=model,
+#     args=training_args,
+#     train_dataset=train_dataset,
+#     eval_dataset=val_dataset,
+#     compute_metrics=compute_metrics,
+# )
+trainer = WeightedTrainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
